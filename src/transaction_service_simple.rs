@@ -156,7 +156,8 @@ impl TransactionService {
         
         for instruction in &transaction.message.instructions {
             // Check if this is a transfer instruction to the tip account
-            if instruction.program_id() == &system_program::id() {
+            let program_id = transaction.message.account_keys[instruction.program_id_index as usize];
+            if program_id == system_program::id() {
                 // For simplicity, we'll assume any system transfer to the tip account is a tip
                 if instruction.accounts.len() >= 2 {
                     let recipient = transaction.message.account_keys[instruction.accounts[1] as usize];
