@@ -14,6 +14,7 @@ mod models;
 mod rate_limiter;
 mod errors;
 mod tip_accounts;
+mod rpc_endpoints;
 
 use transaction_display_service::TransactionDisplayService;
 use models::{TransactionRequest, TransactionResponse, ErrorResponse, DisplayedTransaction};
@@ -21,54 +22,49 @@ use rate_limiter::RateLimiter;
 use serde_json::Value;
 use serde_json::json;
 use base64::Engine;
-use solana_sdk::{system_program, system_instruction::SystemInstruction, native_token::{lamports_to_sol, sol_to_lamports}, pubkey::Pubkey};
+use solana_sdk::{commitment_config::CommitmentConfig, native_token::{lamports_to_sol, sol_to_lamports}, pubkey::Pubkey, system_instruction::SystemInstruction, system_program};
 use solana_sdk::compute_budget::{self, ComputeBudgetInstruction};
+use solana_sdk::transaction::Transaction;
+use solana_sdk::signature::Signature;
 use tip_accounts::{TIP_ACCOUNTS, MIN_TIP};
 use std::str::FromStr;
+use solana_client::rpc_client::RpcClient;
 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
     tracing_subscriber::fmt::init();
     info!("Starting Solana Transaction Display Service...");
     let transaction_service = Arc::new(TransactionDisplayService::new()?);
-    // Rate limiter: configurable via TPS_LIMIT env var
     let tps_limit: u32 = std::env::var("TPS_LIMIT")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(1);
     let rate_limiter = Arc::new(RateLimiter::new(tps_limit));
     info!("Configured TPS limit: {}", tps_limit);
-
     let tip_pubkeys: Vec<Pubkey> = TIP_ACCOUNTS
         .iter()
         .filter_map(|s| Pubkey::from_str(s).ok())
         .collect();
     let min_tip_lamports: u64 = sol_to_lamports(MIN_TIP);
-    
     let state = Arc::new(AppState {
         transaction_service,
         rate_limiter,
         tip_pubkeys,
         min_tip_lamports,
     });
-    
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
-    
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/sendTransaction", post(send_transaction))
         .route("/transactions", get(get_transactions))
         .route("/transactions/:id", get(get_transaction_by_id))
-        // JSON-RPC compatible endpoint
         .route("/rpc", post(json_rpc_handler))
         .layer(cors)
         .with_state(state);
-    
     let listener = bind_with_fallback().await?;
     let addr = listener.local_addr()?;
     info!("Server listening on http://{}:{}", addr.ip(), addr.port());
@@ -78,24 +74,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  POST /rpc - JSON-RPC sendTransaction (base64)");
     info!("  GET  /transactions - Get all displayed transactions");
     info!("  GET  /transactions/:id - Get specific transaction by ID");
-    
     axum::serve(listener, app).await?;
-    
     Ok(())
 }
-
 async fn bind_with_fallback() -> Result<tokio::net::TcpListener, Box<dyn std::error::Error>> {
     let preferred_port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(3000);
-
     let mut candidates: Vec<u16> = Vec::new();
     candidates.push(preferred_port);
     if preferred_port != 3000 { candidates.push(3000); }
     for p in 3001..=3010 { candidates.push(p); }
-    candidates.push(0); // let OS choose an available ephemeral port
-
+    candidates.push(0); 
     for port in candidates {
         let addr = format!("0.0.0.0:{}", port);
         match tokio::net::TcpListener::bind(&addr).await {
@@ -116,10 +107,8 @@ async fn bind_with_fallback() -> Result<tokio::net::TcpListener, Box<dyn std::er
             }
         }
     }
-
     Err("Unable to bind to any port".into())
 }
-
 #[derive(Clone)]
 struct AppState {
     transaction_service: Arc<TransactionDisplayService>,
@@ -127,16 +116,13 @@ struct AppState {
     tip_pubkeys: Vec<Pubkey>,
     min_tip_lamports: u64,
 }
-
 async fn health_check() -> StatusCode {
     StatusCode::OK
 }
-
 async fn json_rpc_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Rate limit JSON-RPC requests as well
     if !state.rate_limiter.check_rate_limit().await {
         let err = json!({
             "jsonrpc": "2.0",
@@ -146,7 +132,6 @@ async fn json_rpc_handler(
         return Ok(Json(err));
     }
     info!("JSON-RPC request: {}", body);
-
     let id = body.get("id").cloned().unwrap_or_else(|| Value::from(1));
     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
     if method != "sendTransaction" {
@@ -158,18 +143,15 @@ async fn json_rpc_handler(
         });
         return Ok(Json(err));
     }
-
     let encoded = body
         .get("params")
         .and_then(|p| p.as_array())
         .and_then(|arr| arr.get(0))
         .and_then(|v| v.as_str());
-
     if let Some(e) = encoded {
         let preview = if e.len() > 64 { format!("{}...", &e[..64]) } else { e.to_string() };
         info!("Received sendTransaction base64 (preview 64): {}", preview);
     }
-
     let Some(encoded_tx) = encoded else {
         error!("Validation failed: missing base64 transaction in params");
         let err = json!({
@@ -179,7 +161,6 @@ async fn json_rpc_handler(
         });
         return Ok(Json(err));
     };
-
     let decoded_bytes = match base64::engine::general_purpose::STANDARD.decode(encoded_tx) {
         Ok(b) => b,
         Err(e) => {
@@ -192,7 +173,6 @@ async fn json_rpc_handler(
             return Ok(Json(err));
         }
     };
-
     let tx: Result<solana_sdk::transaction::Transaction, _> = bincode::deserialize(&decoded_bytes);
     let tx = match tx {
         Ok(t) => t,
@@ -206,7 +186,6 @@ async fn json_rpc_handler(
             return Ok(Json(err));
         }
     };
-
     let mut tip_ok = false;
     if let Some(message) = Some(&tx.message) {
         for ix in &message.instructions {
@@ -246,7 +225,6 @@ async fn json_rpc_handler(
             }
         }
     }
-
     if !tip_ok {
         error!("Validation failed: missing required tip transfer to configured account");
         let err = json!({
@@ -256,7 +234,6 @@ async fn json_rpc_handler(
         });
         return Ok(Json(err));
     }
-
     if let Some(message) = Some(&tx.message) {
         if let Some(payer) = message.account_keys.get(0) {
             info!("Payer: {}", payer);
@@ -301,15 +278,13 @@ async fn json_rpc_handler(
             }
         }
     }
-
     let signature = tx
         .signatures
         .get(0)
         .map(|s| s.to_string())
         .unwrap_or_else(|| "".to_string());
-
     info!("Validation success. Extracted signature: {}", signature);
-
+    send_and_confirm_transaction(&tx);
     let resp = json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -317,7 +292,6 @@ async fn json_rpc_handler(
     });
     Ok(Json(resp))
 }
-
 async fn send_transaction(
     State(state): State<Arc<AppState>>,
     Json(request): Json<TransactionRequest>,
@@ -332,7 +306,6 @@ async fn send_transaction(
             })
         ));
     }
-    
     match state.transaction_service.send_and_display_transaction(&request).await {
         Ok(response) => Ok(Json(response)),
         Err(e) => {
@@ -347,7 +320,6 @@ async fn send_transaction(
         }
     }
 }
-
 async fn get_transactions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<DisplayedTransaction>>, (StatusCode, Json<ErrorResponse>)> {
@@ -365,7 +337,6 @@ async fn get_transactions(
         }
     }
 }
-
 async fn get_transaction_by_id(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -383,4 +354,12 @@ async fn get_transaction_by_id(
             ))
         }
     }
+}
+fn send_and_confirm_transaction(tx: &Transaction) -> Result<Signature, Box<dyn std::error::Error>> {
+    let client = RpcClient::new(rpc_endpoints::rpc_endpoint3.to_string());
+    let signature = client.send_and_confirm_transaction_with_spinner_and_commitment(
+        tx,
+        CommitmentConfig::processed(),
+    )?;
+    Ok(signature)
 }
