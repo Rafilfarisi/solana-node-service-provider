@@ -9,7 +9,12 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::system_instruction;
 use solana_sdk::transaction::Transaction;
+use solana_sdk::pubkey::Pubkey;
+use rand::seq::SliceRandom;
+use std::str::FromStr;
 use std::env;
+use std::thread;
+use std::time::Duration;
 
 fn main() -> Result<()> {
 	// Load .env
@@ -17,8 +22,8 @@ fn main() -> Result<()> {
 
 	// Env config
 	let rpc_endpoint = env::var("RPC_ENDPOINT").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-	let jito_url = env::var("JITO_URL").unwrap_or_else(|_| "https://ny.mainnet.block-engine.jito.wtf/api/v1/transactions".to_string());
-	let jito_bearer = env::var("JITO_BEARER").ok(); // optional
+	let service_url = env::var("SERVICE_URL").unwrap_or_else(|_| "https://ny.mainnet.block-engine.jito.wtf/api/v1/transactions".to_string());
+	let service_bearer = env::var("SERVICE_BEARER").ok(); // optional
 	let mk1 = env::var("mk1").map_err(|_| anyhow!("Missing mk1 in .env"))?;
 	let mk2 = env::var("mk2").map_err(|_| anyhow!("Missing mk2 in .env"))?;
 
@@ -28,17 +33,50 @@ fn main() -> Result<()> {
 	println!("Sender: {}", sender.pubkey());
 	println!("Recipient: {}", recipient.pubkey());
 
-	// Build transfer transaction (1000 lamports)
+	// Build transfer instructions (1000 lamports)
 	let rpc = RpcClient::new_with_commitment(rpc_endpoint.clone(), CommitmentConfig::confirmed());
 	let latest_blockhash = rpc.get_latest_blockhash()?;
 	let ix = system_instruction::transfer(&sender.pubkey(), &recipient.pubkey(), 1000);
-	let tx = Transaction::new_signed_with_payer(&[ix], Some(&sender.pubkey()), &[&sender], latest_blockhash);
 
+	// tip_ix: send SOL from sender to a random one of tip accounts
+	const TIP_ACCOUNTS: [&str; 4] = [
+		"3DpmFFACtWVbkmuMEE6SfVC3JoqHnZmFe5KeBV7Ux8M9",
+		"Ex2kh7BnjbUdD6HFXrtMPq2QVPgPNxxo1y1aV17zcuXV",
+		"EoVbZM9raES9obgXtsMpEBeDPLiK7S8Y16z3uekpQLvm",
+		"GifL6PrDJTKSmucMhFJ8vdgnYNtaiavEGZyv2GLnsUW2",
+	];
+	 let mut rng = rand::thread_rng();
+	 let tip_lamports: u64 = 10000000; // 0.000001 SOL
+	// Send multiple requests at 2 per second rate
+	let requests_per_second = 2;
+	let delay_ms = 1000 / requests_per_second;
+	//println!("Sending {} requests per second ({}ms delay between requests)", requests_per_second, delay_ms);
+
+	for i in 1..=1 { // Send 10 requests total
+	 	println!("Sending request #{}", i);
+		
+		let latest_blockhash = rpc.get_latest_blockhash()?;
+		let ix = system_instruction::transfer(&sender.pubkey(), &recipient.pubkey(), 1000);
+		let tip_str = TIP_ACCOUNTS.choose(&mut rng).ok_or_else(|| anyhow!("No tip accounts configured"))?;
+		let tip_pubkey = Pubkey::from_str(tip_str)?;
+		let tip_ix = system_instruction::transfer(&sender.pubkey(), &tip_pubkey, tip_lamports);
+		let tx = Transaction::new_signed_with_payer(&[ix, tip_ix], Some(&sender.pubkey()), &[&sender], latest_blockhash);
+		//let tx = Transaction::new_signed_with_payer(&[ix], Some(&sender.pubkey()), &[&sender], latest_blockhash);
+		send_transaction(&tx, &service_url, &service_bearer)?;
+		if i < 10 {
+			thread::sleep(Duration::from_millis(delay_ms));
+		}
+	}
+
+	Ok(())
+}
+
+fn send_transaction(tx: &Transaction, service_url: &str, service_bearer: &Option<String>) -> Result<()> {
 	// Encode transaction to base64
-	let tx_bytes = bincode::serialize(&tx)?;
+	let tx_bytes = bincode::serialize(tx)?;
 	let tx_base64 = base64::engine::general_purpose::STANDARD.encode(tx_bytes);
 
-	// JSON-RPC payload for Jito Block Engine
+	// JSON-RPC payload for Service Block Engine
 	let payload = json!({
 		"jsonrpc": "2.0",
 		"id": 1,
@@ -47,23 +85,23 @@ fn main() -> Result<()> {
 	});
 
 	let http = HttpClient::new();
-	let mut req = http.post(jito_url).header(CONTENT_TYPE, "application/json").json(&payload);
-	if let Some(token) = jito_bearer.as_ref() {
+	let mut req = http.post(service_url).header(CONTENT_TYPE, "application/json").json(&payload);
+	if let Some(token) = service_bearer.as_ref() {
 		req = req.header(AUTHORIZATION, format!("Bearer {}", token));
 	}
 	let resp = req.send()?;
 	let status = resp.status();
 	let body = resp.text()?;
 	if !status.is_success() {
-		println!("Jito returned error {}: {}", status, body);
-		return Err(anyhow!("jito error"));
+		println!("Service returned error {}: {}", status, body);
+		return Err(anyhow!("Service error"));
 	}
 
 	let v: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"raw": body}));
 	if let Some(sig) = v.get("result").and_then(|s| s.as_str()) {
-		println!("Jito signature: {}", sig);
+		println!("Service signature: {}", sig);
 	} else {
-		println!("Jito response: {}", body);
+		println!("Service response: {}", body);
 	}
 	Ok(())
 }

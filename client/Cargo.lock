@@ -3934,6 +3934,7 @@ dependencies = [
  "bs58 0.5.1",
  "dotenv",
  "hex",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
