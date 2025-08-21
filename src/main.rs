@@ -31,21 +31,22 @@ use std::str::FromStr;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
-    
     info!("Starting Solana Transaction Display Service...");
-    
-    // Initialize services
     let transaction_service = Arc::new(TransactionDisplayService::new()?);
-    let rate_limiter = Arc::new(RateLimiter::new(100)); // 100 TPS limit
+    // Rate limiter: configurable via TPS_LIMIT env var
+    let tps_limit: u32 = std::env::var("TPS_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    let rate_limiter = Arc::new(RateLimiter::new(tps_limit));
+    info!("Configured TPS limit: {}", tps_limit);
 
-    // Build tip config from constants
     let tip_pubkeys: Vec<Pubkey> = TIP_ACCOUNTS
         .iter()
         .filter_map(|s| Pubkey::from_str(s).ok())
         .collect();
     let min_tip_lamports: u64 = sol_to_lamports(MIN_TIP);
     
-    // Create shared state
     let state = Arc::new(AppState {
         transaction_service,
         rate_limiter,
@@ -53,13 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_tip_lamports,
     });
     
-    // Configure CORS
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
     
-    // Create router
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/sendTransaction", post(send_transaction))
@@ -70,7 +69,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(cors)
         .with_state(state);
     
-    // Start server with fallback port binding
     let listener = bind_with_fallback().await?;
     let addr = listener.local_addr()?;
     info!("Server listening on http://{}:{}", addr.ip(), addr.port());
@@ -92,7 +90,6 @@ async fn bind_with_fallback() -> Result<tokio::net::TcpListener, Box<dyn std::er
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(3000);
 
-    // Try preferred, then a small range, then ephemeral (0)
     let mut candidates: Vec<u16> = Vec::new();
     candidates.push(preferred_port);
     if preferred_port != 3000 { candidates.push(3000); }
@@ -135,12 +132,19 @@ async fn health_check() -> StatusCode {
     StatusCode::OK
 }
 
-// JSON-RPC compatible handler for sendTransaction
 async fn json_rpc_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Log full request
+    // Rate limit JSON-RPC requests as well
+    if !state.rate_limiter.check_rate_limit().await {
+        let err = json!({
+            "jsonrpc": "2.0",
+            "id": body.get("id").cloned().unwrap_or_else(|| Value::from(1)),
+            "error": {"code": -32098, "message": "Rate limit exceeded"}
+        });
+        return Ok(Json(err));
+    }
     info!("JSON-RPC request: {}", body);
 
     let id = body.get("id").cloned().unwrap_or_else(|| Value::from(1));
@@ -155,14 +159,12 @@ async fn json_rpc_handler(
         return Ok(Json(err));
     }
 
-    // Extract base64 transaction from params[0]
     let encoded = body
         .get("params")
         .and_then(|p| p.as_array())
         .and_then(|arr| arr.get(0))
         .and_then(|v| v.as_str());
 
-    // Log a short summary of the tx base64
     if let Some(e) = encoded {
         let preview = if e.len() > 64 { format!("{}...", &e[..64]) } else { e.to_string() };
         info!("Received sendTransaction base64 (preview 64): {}", preview);
@@ -178,7 +180,6 @@ async fn json_rpc_handler(
         return Ok(Json(err));
     };
 
-    // Decode and deserialize transaction
     let decoded_bytes = match base64::engine::general_purpose::STANDARD.decode(encoded_tx) {
         Ok(b) => b,
         Err(e) => {
@@ -206,7 +207,6 @@ async fn json_rpc_handler(
         }
     };
 
-    // Tip validation: require a system transfer to a configured tip account with minimum amount
     let mut tip_ok = false;
     if let Some(message) = Some(&tx.message) {
         for ix in &message.instructions {
@@ -257,7 +257,6 @@ async fn json_rpc_handler(
         return Ok(Json(err));
     }
 
-    // Existing verbose logs of payer/header/instructions
     if let Some(message) = Some(&tx.message) {
         if let Some(payer) = message.account_keys.get(0) {
             info!("Payer: {}", payer);

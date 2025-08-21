@@ -1,46 +1,40 @@
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use dashmap::DashMap;
-use uuid::Uuid;
 
 pub struct RateLimiter {
     max_requests_per_second: u32,
-    requests: DashMap<String, Vec<Instant>>,
+    window: Duration,
+    timestamps: Mutex<VecDeque<Instant>>, // global timestamps within window
 }
 
 impl RateLimiter {
     pub fn new(max_requests_per_second: u32) -> Self {
         Self {
             max_requests_per_second,
-            requests: DashMap::new(),
+            window: Duration::from_secs(1),
+            timestamps: Mutex::new(VecDeque::new()),
         }
     }
     
     pub async fn check_rate_limit(&self) -> bool {
-        let client_id = Uuid::new_v4().to_string();
         let now = Instant::now();
-        let window_start = now - Duration::from_secs(1);        
-        
-        let mut requests = self.requests
-            .entry(client_id.clone())
-            .or_insert_with(Vec::new);        
-        
-        requests.retain(|&timestamp| timestamp >= window_start);        
-        
-        if requests.len() < self.max_requests_per_second as usize {
-            requests.push(now);
+        let mut q = self.timestamps.lock().expect("rate limiter mutex poisoned");
+
+        // Evict timestamps older than window
+        while let Some(&front) = q.front() {
+            if now.duration_since(front) >= self.window {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if q.len() < self.max_requests_per_second as usize {
+            q.push_back(now);
             true
         } else {
             false
         }
-    }
-    
-    pub fn cleanup_old_entries(&self) {
-        let now = Instant::now();
-        let window_start = now - Duration::from_secs(1);
-        
-        self.requests.retain(|_, requests| {
-            requests.retain(|&timestamp| timestamp >= window_start);
-            !requests.is_empty()
-        });
     }
 }

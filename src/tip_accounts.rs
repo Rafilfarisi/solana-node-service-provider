@@ -5,4 +5,4 @@ pub const TIP_ACCOUNTS: [&str; 4] = [
     "GifL6PrDJTKSmucMhFJ8vdgnYNtaiavEGZyv2GLnsUW2",
 ];
 
-pub const MIN_TIP: f64 = 0.000001;
+pub const MIN_TIP: f64 = 0.001;
