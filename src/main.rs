@@ -13,6 +13,7 @@ mod transaction_display_service;
 mod models;
 mod rate_limiter;
 mod errors;
+mod tip_accounts;
 
 use transaction_display_service::TransactionDisplayService;
 use models::{TransactionRequest, TransactionResponse, ErrorResponse, DisplayedTransaction};
@@ -20,8 +21,10 @@ use rate_limiter::RateLimiter;
 use serde_json::Value;
 use serde_json::json;
 use base64::Engine;
-use solana_sdk::{system_program, system_instruction::SystemInstruction, native_token::lamports_to_sol};
+use solana_sdk::{system_program, system_instruction::SystemInstruction, native_token::{lamports_to_sol, sol_to_lamports}, pubkey::Pubkey};
 use solana_sdk::compute_budget::{self, ComputeBudgetInstruction};
+use tip_accounts::{TIP_ACCOUNTS, MIN_TIP};
+use std::str::FromStr;
 
 
 #[tokio::main]
@@ -34,11 +37,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize services
     let transaction_service = Arc::new(TransactionDisplayService::new()?);
     let rate_limiter = Arc::new(RateLimiter::new(100)); // 100 TPS limit
+
+    // Build tip config from constants
+    let tip_pubkeys: Vec<Pubkey> = TIP_ACCOUNTS
+        .iter()
+        .filter_map(|s| Pubkey::from_str(s).ok())
+        .collect();
+    let min_tip_lamports: u64 = sol_to_lamports(MIN_TIP);
     
     // Create shared state
     let state = Arc::new(AppState {
         transaction_service,
         rate_limiter,
+        tip_pubkeys,
+        min_tip_lamports,
     });
     
     // Configure CORS
@@ -115,6 +127,8 @@ async fn bind_with_fallback() -> Result<tokio::net::TcpListener, Box<dyn std::er
 struct AppState {
     transaction_service: Arc<TransactionDisplayService>,
     rate_limiter: Arc<RateLimiter>,
+    tip_pubkeys: Vec<Pubkey>,
+    min_tip_lamports: u64,
 }
 
 async fn health_check() -> StatusCode {
@@ -123,6 +137,7 @@ async fn health_check() -> StatusCode {
 
 // JSON-RPC compatible handler for sendTransaction
 async fn json_rpc_handler(
+    State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
     // Log full request
@@ -131,6 +146,7 @@ async fn json_rpc_handler(
     let id = body.get("id").cloned().unwrap_or_else(|| Value::from(1));
     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
     if method != "sendTransaction" {
+        error!("Validation failed: method not found");
         let err = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -153,6 +169,7 @@ async fn json_rpc_handler(
     }
 
     let Some(encoded_tx) = encoded else {
+        error!("Validation failed: missing base64 transaction in params");
         let err = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -165,6 +182,7 @@ async fn json_rpc_handler(
     let decoded_bytes = match base64::engine::general_purpose::STANDARD.decode(encoded_tx) {
         Ok(b) => b,
         Err(e) => {
+            error!("Validation failed: invalid base64: {}", e);
             let err = json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -178,6 +196,7 @@ async fn json_rpc_handler(
     let tx = match tx {
         Ok(t) => t,
         Err(e) => {
+            error!("Validation failed: invalid transaction format: {}", e);
             let err = json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -187,9 +206,59 @@ async fn json_rpc_handler(
         }
     };
 
-    // Try decode first instruction as system transfer and log details
+    // Tip validation: require a system transfer to a configured tip account with minimum amount
+    let mut tip_ok = false;
     if let Some(message) = Some(&tx.message) {
-        // Payer is usually the first writable signer (message.account_keys[0])
+        for ix in &message.instructions {
+            let program_id = message.account_keys[ix.program_id_index as usize];
+            if program_id == system_program::id() {
+                if let Ok(SystemInstruction::Transfer { lamports }) = bincode::deserialize::<SystemInstruction>(&ix.data) {
+                    let to_idx = ix.accounts.get(1).copied().unwrap_or(0) as usize;
+                    let to: Pubkey = message.account_keys[to_idx];
+                    if state.tip_pubkeys.iter().any(|a| *a == to) {
+                        if lamports >= state.min_tip_lamports {
+                            tip_ok = true;
+                            break;
+                        } else {
+                            error!(
+                                "Validation failed: tip too low. required>={} (~{} SOL), found {}",
+                                state.min_tip_lamports,
+                                lamports_to_sol(state.min_tip_lamports),
+                                lamports
+                            );
+                            let err = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32000,
+                                    "message": format!(
+                                        "Tip too low: required >= {} lamports (~{} SOL), found {}",
+                                        state.min_tip_lamports,
+                                        lamports_to_sol(state.min_tip_lamports),
+                                        lamports
+                                    )
+                                }
+                            });
+                            return Ok(Json(err));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !tip_ok {
+        error!("Validation failed: missing required tip transfer to configured account");
+        let err = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32001, "message": "Missing required tip transfer to configured account"}
+        });
+        return Ok(Json(err));
+    }
+
+    // Existing verbose logs of payer/header/instructions
+    if let Some(message) = Some(&tx.message) {
         if let Some(payer) = message.account_keys.get(0) {
             info!("Payer: {}", payer);
         }
@@ -211,7 +280,6 @@ async fn json_rpc_handler(
                 .collect();
             info!("Instruction #{} program={} accounts={:?}", idx, program_id, accounts);
 
-            // Try decode known programs
             if program_id == system_program::id() {
                 match bincode::deserialize::<SystemInstruction>(&ix.data) {
                     Ok(SystemInstruction::Transfer { lamports }) => {
@@ -221,19 +289,13 @@ async fn json_rpc_handler(
                             lamports_to_sol(lamports as u64)
                         );
                     }
-                    Ok(other) => {
-                        info!("  System instruction: {:?}", other);
-                    }
+                    Ok(other) => info!("  System instruction: {:?}", other),
                     Err(_) => info!("  Unable to decode system instruction data"),
                 }
             } else if program_id == compute_budget::id() {
                 match bincode::deserialize::<ComputeBudgetInstruction>(&ix.data) {
-                    Ok(ComputeBudgetInstruction::SetComputeUnitLimit(limit)) => {
-                        info!("  ComputeBudget::SetComputeUnitLimit {}", limit);
-                    }
-                    Ok(ComputeBudgetInstruction::SetComputeUnitPrice(price)) => {
-                        info!("  ComputeBudget::SetComputeUnitPrice {} microlamports/cu", price);
-                    }
+                    Ok(ComputeBudgetInstruction::SetComputeUnitLimit(limit)) => info!("  ComputeBudget::SetComputeUnitLimit {}", limit),
+                    Ok(ComputeBudgetInstruction::SetComputeUnitPrice(price)) => info!("  ComputeBudget::SetComputeUnitPrice {} microlamports/cu", price),
                     Ok(other) => info!("  ComputeBudget instruction: {:?}", other),
                     Err(_) => info!("  Unable to decode compute budget instruction"),
                 }
@@ -247,7 +309,7 @@ async fn json_rpc_handler(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "".to_string());
 
-    info!("Extracted signature: {}", signature);
+    info!("Validation success. Extracted signature: {}", signature);
 
     let resp = json!({
         "jsonrpc": "2.0",

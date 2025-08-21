@@ -26,9 +26,7 @@ impl TransactionService {
         // You can configure different RPC endpoints here
         let rpc_url = std::env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-        
         let rpc_client = RpcClient::new(rpc_url);
-        
         Ok(Self { rpc_client })
     }
     
@@ -37,26 +35,16 @@ impl TransactionService {
         request: &TransactionRequest,
     ) -> Result<TransactionResponse, ServiceError> {
         let transaction_id = uuid::Uuid::new_v4().to_string();
-        
         info!("Simulating transaction: {}", transaction_id);
-        
-        // Decode and validate transaction
         let transaction = self.decode_transaction(&request.transaction)?;
-        
-        // Validate tip account
         let tip_account = Pubkey::from_str(&request.tip_account)
             .map_err(|e| ServiceError::InvalidTipAccount(e.to_string()))?;
-        
-        // Simulate transaction
         let simulation_result = self.simulate_transaction_internal(&transaction).await?;
-        
-        // Validate tip instructions
         let tip_validation = self.validate_tip_instructions(
             &transaction,
             &tip_account,
             request.minimum_tip_amount,
         )?;
-        
         if !tip_validation.is_valid {
             return Ok(TransactionResponse {
                 success: false,
@@ -73,7 +61,6 @@ impl TransactionService {
                 transaction_id,
             });
         }
-        
         Ok(TransactionResponse {
             success: true,
             signature: None,
