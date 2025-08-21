@@ -28,6 +28,9 @@ pub enum ServiceError {
     
     #[error("Internal error: {0}")]
     Internal(String),
+    
+    #[error("Transaction not found: {0}")]
+    TransactionNotFound(String),
 }
 
 impl From<solana_client::client_error::ClientError> for ServiceError {
