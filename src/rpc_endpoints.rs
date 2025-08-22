@@ -1,3 +1,8 @@
-pub const rpc_endpoint1: &str = "";
-pub const rpc_endpoint2: &str = "";
-pub const rpc_endpoint3: &str = "https://api.mainnet-beta.solana.com";
+
+pub const RPC_ENDPOINTS: [&str; 1] = [
+    
+    //  "https://solana-api.projectserum.com",
+    //  "https://rpc.ankr.com/solana",
+    //  "https://solana.public-rpc.com",
+     "https://api.mainnet-beta.solana.com", // Fallback to primary
+];

@@ -3999,6 +3999,7 @@ dependencies = [
  "base64 0.21.7",
  "bincode",
  "chrono",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "solana-client",

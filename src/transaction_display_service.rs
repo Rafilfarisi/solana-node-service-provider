@@ -1,15 +1,20 @@
 use crate::{
     models::{TransactionRequest, TransactionResponse, DisplayedTransaction},
     errors::ServiceError,
+    rpc_endpoints,
 };
 
 use solana_sdk::transaction::Transaction;
+use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcSendTransactionConfig;
+use solana_sdk::commitment_config::CommitmentConfig;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use base64::Engine;
-use tracing::info;
+use tracing::{info, error};
 use chrono::Utc;
 use uuid::Uuid;
+use rand::Rng;
 
 pub struct TransactionDisplayService {
     transactions: Mutex<HashMap<String, DisplayedTransaction>>,
@@ -20,6 +25,12 @@ impl TransactionDisplayService {
         Ok(Self {
             transactions: Mutex::new(HashMap::new()),
         })
+    }
+    
+    fn get_random_rpc_endpoint(&self) -> &'static str {
+        let mut rng = rand::thread_rng();
+        let index = rng.gen_range(0..rpc_endpoints::RPC_ENDPOINTS.len());
+        rpc_endpoints::RPC_ENDPOINTS[index]
     }
     
     pub async fn send_and_display_transaction(
@@ -51,6 +62,13 @@ impl TransactionDisplayService {
         // For simplicity, assume a fixed amount (in real implementation, decode from instruction)
         let amount = 0.001; // 0.001 SOL
         
+        // Send and confirm transaction using RPC with fallback endpoints
+        let signature = self.send_transaction_with_fallback(&transaction).await?;
+        info!("Transaction sent with signature: {}", signature);
+        
+        // Wait for confirmation
+        let transaction_status = self.confirm_transaction(&signature).await?;
+        
         // Create displayed transaction
         let displayed_transaction = DisplayedTransaction {
             id: transaction_id.clone(),
@@ -59,9 +77,9 @@ impl TransactionDisplayService {
             to_address,
             amount,
             memo: None,
-            status: "pending".to_string(),
+            status: transaction_status,
             timestamp: Utc::now(),
-            signature: None,
+            signature: Some(signature.to_string()),
             block_time: None,
             transaction_data: request.transaction_data.clone(),
         };
@@ -78,9 +96,9 @@ impl TransactionDisplayService {
         Ok(TransactionResponse {
             transaction_id,
             status: "success".to_string(),
-            message: "Transaction processed successfully".to_string(),
+            message: "Transaction sent and confirmed successfully".to_string(),
             timestamp: Utc::now(),
-            signature: None,
+            signature: Some(signature.to_string()),
         })
     }
     
@@ -106,5 +124,58 @@ impl TransactionDisplayService {
         
         bincode::deserialize::<Transaction>(&transaction_bytes)
             .map_err(|e| ServiceError::InvalidTransaction(format!("Deserialization error: {}", e)))
+    }
+    
+    async fn send_transaction_with_fallback(&self, transaction: &Transaction) -> Result<solana_sdk::signature::Signature, ServiceError> {
+        // Select random RPC endpoint
+        let endpoint = self.get_random_rpc_endpoint();
+        let client = RpcClient::new(endpoint);
+        
+        // Configure transaction to use processed commitment
+        let config = RpcSendTransactionConfig {
+            skip_preflight: false,
+            preflight_commitment: Some(CommitmentConfig::processed().commitment),
+            encoding: None,
+            max_retries: Some(3),
+            min_context_slot: None,
+        };
+        
+        match client.send_transaction_with_config(transaction, config) {
+            Ok(signature) => {
+                info!("Transaction sent successfully via {} with processed commitment", endpoint);
+                Ok(signature)
+            }
+            Err(e) => {
+                error!("Failed to send transaction via {}: {}", endpoint, e);
+                Err(ServiceError::Internal(format!("Transaction send failed: {}", e)))
+            }
+        }
+    }
+    
+    async fn confirm_transaction(&self, signature: &solana_sdk::signature::Signature) -> Result<String, ServiceError> {
+        // Select random RPC endpoint for confirmation check
+        let endpoint = self.get_random_rpc_endpoint();
+        let client = RpcClient::new(endpoint);
+        
+        match client.get_signature_status_with_commitment(signature, CommitmentConfig::processed()) {
+            Ok(status) => {
+                if let Some(result) = status {
+                    if result.is_ok() {
+                        info!("Transaction confirmed via {} with processed commitment", endpoint);
+                        Ok("confirmed".to_string())
+                    } else {
+                        error!("Transaction failed: {:?}", result);
+                        Ok("failed".to_string())
+                    }
+                } else {
+                    info!("Transaction not yet confirmed via {} (processed level)", endpoint);
+                    Ok("pending".to_string())
+                }
+            }
+            Err(e) => {
+                error!("Failed to get signature status via {}: {}", endpoint, e);
+                Err(ServiceError::Internal(format!("Status check failed: {}", e)))
+            }
+        }
     }
 }

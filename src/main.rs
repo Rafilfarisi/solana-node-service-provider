@@ -22,13 +22,10 @@ use rate_limiter::RateLimiter;
 use serde_json::Value;
 use serde_json::json;
 use base64::Engine;
-use solana_sdk::{commitment_config::CommitmentConfig, native_token::{lamports_to_sol, sol_to_lamports}, pubkey::Pubkey, system_instruction::SystemInstruction, system_program};
+use solana_sdk::{native_token::{lamports_to_sol, sol_to_lamports}, pubkey::Pubkey, system_instruction::SystemInstruction, system_program};
 use solana_sdk::compute_budget::{self, ComputeBudgetInstruction};
-use solana_sdk::transaction::Transaction;
-use solana_sdk::signature::Signature;
 use tip_accounts::{TIP_ACCOUNTS, MIN_TIP};
 use std::str::FromStr;
-use solana_client::rpc_client::RpcClient;
 
 
 #[tokio::main]
@@ -283,14 +280,38 @@ async fn json_rpc_handler(
         .get(0)
         .map(|s| s.to_string())
         .unwrap_or_else(|| "".to_string());
-    info!("Validation success. Extracted signature: {}", signature);
-    send_and_confirm_transaction(&tx);
-    let resp = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": signature
-    });
-    Ok(Json(resp))
+        info!("Validation success. Extracted signature: {}", signature);
+    
+    // Create TransactionRequest to call the transaction service
+    let transaction_request = TransactionRequest {
+        from_address: "".to_string(), // Will be extracted from transaction
+        to_address: "".to_string(),   // Will be extracted from transaction
+        amount: 0.0,                  // Will be calculated from transaction
+        memo: None,
+        transaction_data: Some(encoded_tx.to_string()),
+        signature: None,
+    };
+    
+    // Call the transaction service to send and confirm the transaction
+    match state.transaction_service.send_and_display_transaction(&transaction_request).await {
+        Ok(response) => {
+            let resp = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": response.signature.unwrap_or_else(|| signature)
+            });
+            Ok(Json(resp))
+        }
+        Err(e) => {
+            error!("Transaction service error: {:?}", e);
+            let err = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32000, "message": format!("Transaction service failed: {}", e)}
+            });
+            Ok(Json(err))
+        }
+    }
 }
 async fn send_transaction(
     State(state): State<Arc<AppState>>,
@@ -355,11 +376,5 @@ async fn get_transaction_by_id(
         }
     }
 }
-fn send_and_confirm_transaction(tx: &Transaction) -> Result<Signature, Box<dyn std::error::Error>> {
-    let client = RpcClient::new(rpc_endpoints::rpc_endpoint3.to_string());
-    let signature = client.send_and_confirm_transaction_with_spinner_and_commitment(
-        tx,
-        CommitmentConfig::processed(),
-    )?;
-    Ok(signature)
-}
+
+
